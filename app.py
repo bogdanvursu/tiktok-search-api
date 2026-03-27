@@ -228,110 +228,6 @@ class PlaywrightManager:
             except Exception:
                 pass
 
-
-    async def _debug_info(self):
-        """Get debug info about browser state."""
-        await self._ensure_browser()
-        context = await self._browser.new_context(
-            user_agent=DESKTOP_UA,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
-        page = await context.new_page()
-        
-        intercepted = {"body": b"", "status": 0}
-        event = asyncio.Event()
-        
-        async def on_response(resp):
-            if "/api/search/general/full/" in resp.url and not event.is_set():
-                body = await resp.body()
-                intercepted["body"] = body
-                intercepted["status"] = resp.status
-                event.set()
-        
-        page.on("response", on_response)
-        
-        try:
-            await page.goto("https://www.tiktok.com/search?q=test", timeout=20000, wait_until="commit")
-            await page.wait_for_timeout(3000)
-            
-            cookies = await context.cookies("https://www.tiktok.com")
-            cookie_names = [c["name"] for c in cookies]
-            
-            params = {"keyword": "test", "offset": "0", "count": "5", "from_page": "search"}
-            js = "async (p) => { fetch('/api/search/general/full/?' + new URLSearchParams(p).toString(), {credentials: 'include'}); }"
-            await page.evaluate(js, params)
-            
-            try:
-                await asyncio.wait_for(event.wait(), timeout=15)
-            except asyncio.TimeoutError:
-                pass
-            
-            body = intercepted["body"]
-            return {
-                "pageUrl": page.url,
-                "cookieCount": len(cookies),
-                "cookieNames": cookie_names,
-                "hasMsToken": any("msToken" in n for n in cookie_names),
-                "apiStatus": intercepted["status"],
-                "apiBodyLen": len(body),
-                "apiBodyStart": body[:200].decode("utf-8", errors="replace") if body else ""
-            }
-        finally:
-            await context.close()
-
-
-    async def _debug_info(self):
-        """Get debug info about browser state."""
-        await self._ensure_browser()
-        context = await self._browser.new_context(
-            user_agent=DESKTOP_UA,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
-        page = await context.new_page()
-        
-        intercepted = {"body": b"", "status": 0}
-        event = asyncio.Event()
-        
-        async def on_response(resp):
-            if "/api/search/general/full/" in resp.url and not event.is_set():
-                body = await resp.body()
-                intercepted["body"] = body
-                intercepted["status"] = resp.status
-                event.set()
-        
-        page.on("response", on_response)
-        
-        try:
-            await page.goto("https://www.tiktok.com/search?q=test", timeout=20000, wait_until="commit")
-            await page.wait_for_timeout(3000)
-            
-            cookies = await context.cookies("https://www.tiktok.com")
-            cookie_names = [c["name"] for c in cookies]
-            
-            params = {"keyword": "test", "offset": "0", "count": "5", "from_page": "search"}
-            js = "async (p) => { fetch('/api/search/general/full/?' + new URLSearchParams(p).toString(), {credentials: 'include'}); }"
-            await page.evaluate(js, params)
-            
-            try:
-                await asyncio.wait_for(event.wait(), timeout=15)
-            except asyncio.TimeoutError:
-                pass
-            
-            body = intercepted["body"]
-            return {
-                "pageUrl": page.url,
-                "cookieCount": len(cookies),
-                "cookieNames": cookie_names,
-                "hasMsToken": any("msToken" in n for n in cookie_names),
-                "apiStatus": intercepted["status"],
-                "apiBodyLen": len(body),
-                "apiBodyStart": body[:200].decode("utf-8", errors="replace") if body else ""
-            }
-        finally:
-            await context.close()
-
     def is_ready(self):
         return self._browser is not None and self._browser.is_connected()
 
@@ -513,26 +409,6 @@ def index():
         },
     })
 
-
-
-@app.route("/debug")
-def debug():
-    """Debug endpoint to check what cookies TikTok sets."""
-    try:
-        result = pw_manager._run_coro(pw_manager._debug_info(), timeout=60)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug")
-def debug():
-    """Debug endpoint to check what cookies TikTok sets."""
-    try:
-        result = pw_manager._run_coro(pw_manager._debug_info(), timeout=60)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     logger.info("=" * 60)
