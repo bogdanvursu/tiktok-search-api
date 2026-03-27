@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: tiktok-search-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: WORKER_PORT
+        value: 8764
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    healthCheckPath: /health
