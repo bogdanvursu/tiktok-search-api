@@ -1,8 +1,8 @@
 """
-TikTok Search API v5.0
+TikTok Search API v6.0
 ======================
 Single-process architecture: Flask + Playwright asyncio in background thread.
-No subprocess needed - more reliable on cloud platforms.
+Uses network response interception instead of JS fetch - works on cloud IPs too.
 """
 import asyncio
 import json
@@ -10,9 +10,10 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from flask import Flask, jsonify, request
 
@@ -31,57 +32,12 @@ ANDROID_UA = (
     "Chrome/91.0.4472.120 Mobile Safari/537.36"
 )
 
-FETCH_JS = """
-async (args) => {
-    const { keyword, cursor, count, searchId } = args;
-    const params = new URLSearchParams({
-        keyword: keyword,
-        offset: String(cursor),
-        count: String(count),
-        from_page: "search",
-        web_search_code: JSON.stringify({
-            tiktok: {
-                client_params_x: {
-                    search_engine: {
-                        ies_mt_user_live_video_card_use_libra: 1,
-                        mt_search_general_user_live_card: 1
-                    }
-                },
-                search_server: {}
-            }
-        })
-    });
-    if (searchId) params.set("search_id", searchId);
-    try {
-        const resp = await fetch(
-            "/api/search/general/full/?" + params.toString(),
-            {
-                credentials: "include",
-                headers: {
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "sec-fetch-dest": "empty",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-site": "same-origin",
-                    "X-Requested-With": "com.zhiliaoapp.musically"
-                }
-            }
-        );
-        const text = await resp.text();
-        return { ok: true, status: resp.status, body: text, pageUrl: window.location.href };
-    } catch(e) {
-        return { ok: false, error: e.toString(), pageUrl: window.location.href };
-    }
-}
-"""
-
 
 class PlaywrightManager:
     def __init__(self):
         self._loop = None
         self._playwright = None
         self._browser = None
-        self._sessions = {}
         self._ready = threading.Event()
         self._error = None
 
@@ -147,37 +103,13 @@ class PlaywrightManager:
         if not self._browser or not self._browser.is_connected():
             logger.warning("[PW] Browser disconnected, restarting...")
             await self._init()
-            self._sessions = {}
 
-    async def _get_or_create_session(self, session_id, query):
+    async def _async_search(self, query, cursor, count, search_id):
+        """
+        Search using network response interception.
+        This works even when TikTok does not set cookies for cloud IPs.
+        """
         await self._ensure_browser()
-
-        if session_id and session_id in self._sessions:
-            session = self._sessions[session_id]
-            try:
-                if not session["page"].is_closed():
-                    logger.info(f"[PW] Reusing session {session_id[:8]} for '{query}'")
-                    return session["page"], session_id
-            except Exception:
-                pass
-            del self._sessions[session_id]
-
-        now = time.time()
-        expired = [k for k, v in list(self._sessions.items()) if now - v["created_at"] > 180]
-        for k in expired:
-            try:
-                await self._sessions[k]["context"].close()
-            except Exception:
-                pass
-            del self._sessions[k]
-
-        if len(self._sessions) >= 2:
-            oldest = min(self._sessions, key=lambda k: self._sessions[k]["created_at"])
-            try:
-                await self._sessions[oldest]["context"].close()
-            except Exception:
-                pass
-            del self._sessions[oldest]
 
         context = await self._browser.new_context(
             user_agent=ANDROID_UA,
@@ -198,104 +130,107 @@ class PlaywrightManager:
         )
 
         page = await context.new_page()
-        logger.info(f"[PW] Navigating to TikTok search: '{query}'")
-        try:
-            await page.goto(
-                f"https://www.tiktok.com/search?q={query}",
-                timeout=30000,
-                wait_until="commit",
-            )
-            logger.info(f"[PW] Page loaded: {page.url}")
-        except Exception as e:
-            logger.warning(f"[PW] Partial navigation (OK): {type(e).__name__}: {e}")
+        session_id = str(uuid.uuid4())
+        intercepted_data = {"body": None, "status": None, "error": None}
+        intercept_event = asyncio.Event()
 
-        await page.wait_for_timeout(6000)
-
-        new_sid = str(uuid.uuid4())
-        self._sessions[new_sid] = {
-            "page": page,
-            "context": context,
-            "query": query,
-            "created_at": time.time(),
-        }
-        logger.info(f"[PW] New session: {new_sid[:8]}, page: {page.url}")
-        return page, new_sid
-
-    async def _async_search(self, query, cursor, count, search_id):
-        page, session_id = await self._get_or_create_session(search_id, query)
-        logger.info(f"[PW] Fetch API: query='{query}' cursor={cursor} count={count}")
-
-        try:
-            result = await page.evaluate(
-                FETCH_JS,
-                {"keyword": query, "cursor": cursor, "count": count,
-                 "searchId": search_id or ""}
-            )
-        except Exception as e:
-            if "closed" in str(e).lower() or "target" in str(e).lower():
-                logger.warning(f"[PW] Page closed, new session: {e}")
-                if search_id and search_id in self._sessions:
-                    del self._sessions[search_id]
-                page, session_id = await self._get_or_create_session(None, query)
-                result = await page.evaluate(
-                    FETCH_JS,
-                    {"keyword": query, "cursor": cursor, "count": count, "searchId": ""}
-                )
-            else:
-                raise RuntimeError(f"Fetch error: {e}")
-
-        if not result.get("ok", True):
-            raise RuntimeError(f"JS fetch error: {result.get('error', 'unknown')}")
-
-        status = result.get("status", 0)
-        body = result.get("body", "")
-        page_url = result.get("pageUrl", "")
-
-        logger.info(f"[PW] TikTok response: status={status}, body_len={len(body)}, pageUrl={page_url[:80]}")
-
-        if not body:
-            raise ValueError(f"Empty response from TikTok (status={status}, pageUrl={page_url})")
-
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON: {e} | body={body[:200]}")
-
-        return {"data": data, "session_id": session_id}
-
-
-    async def _debug_info(self):
-        """Get debug info about browser state."""
-        if not self._browser or not self._browser.is_connected():
-            return {"browser": "not connected"}
-        
-        context = await self._browser.new_context(
-            user_agent=ANDROID_UA, is_mobile=True, has_touch=True
-        )
-        page = await context.new_page()
-        try:
-            await page.goto("https://www.tiktok.com/search?q=test", timeout=20000, wait_until="commit")
-            await page.wait_for_timeout(5000)
-            
-            result = await page.evaluate("""
-                async () => {
-                    const cookies = document.cookie;
-                    const params = new URLSearchParams({keyword: 'test', offset: '0', count: '5', from_page: 'search'});
-                    const resp = await fetch('/api/search/general/full/?' + params.toString(), {credentials: 'include'});
-                    const text = await resp.text();
-                    return {
-                        pageUrl: window.location.href,
-                        cookieCount: cookies.split(';').length,
-                        cookieNames: cookies.split(';').map(c => c.trim().split('=')[0]),
-                        apiStatus: resp.status,
-                        apiBodyLen: text.length,
-                        apiBodyStart: text.substring(0, 200)
-                    };
+        params = {
+            "keyword": query,
+            "offset": str(cursor),
+            "count": str(count),
+            "from_page": "search",
+            "web_search_code": json.dumps({
+                "tiktok": {
+                    "client_params_x": {
+                        "search_engine": {
+                            "ies_mt_user_live_video_card_use_libra": 1,
+                            "mt_search_general_user_live_card": 1
+                        }
+                    },
+                    "search_server": {}
                 }
-            """)
-            return result
+            })
+        }
+        if search_id:
+            params["search_id"] = search_id
+
+        api_url_prefix = "/api/search/general/full/"
+
+        async def handle_response(response):
+            if api_url_prefix in response.url and not intercept_event.is_set():
+                try:
+                    body = await response.body()
+                    intercepted_data["body"] = body
+                    intercepted_data["status"] = response.status
+                    logger.info(f"[PW] Intercepted API: status={response.status}, len={len(body)}")
+                    intercept_event.set()
+                except Exception as e:
+                    intercepted_data["error"] = str(e)
+                    intercept_event.set()
+
+        page.on("response", handle_response)
+
+        try:
+            logger.info(f"[PW] Navigating to TikTok search: {query!r}")
+            try:
+                await page.goto(
+                    "https://www.tiktok.com/search?q=" + urllib.parse.quote(query),
+                    timeout=25000,
+                    wait_until="commit",
+                )
+                logger.info(f"[PW] Page loaded: {page.url}")
+            except Exception as e:
+                logger.warning(f"[PW] Partial navigation (OK): {type(e).__name__}")
+
+            await page.wait_for_timeout(3000)
+
+            logger.info(f"[PW] Triggering fetch: query={query!r} cursor={cursor}")
+            await page.evaluate(
+                """
+                async (params) => {
+                    const p = new URLSearchParams(params);
+                    fetch('/api/search/general/full/?' + p.toString(), {
+                        credentials: 'include',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'sec-fetch-dest': 'empty',
+                            'sec-fetch-mode': 'cors',
+                            'sec-fetch-site': 'same-origin',
+                        }
+                    });
+                }
+                """,
+                params
+            )
+
+            try:
+                await asyncio.wait_for(intercept_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                raise ValueError(f"Timeout waiting for TikTok API response (query={query!r})")
+
+            if intercepted_data["error"]:
+                raise ValueError(f"Error intercepting response: {intercepted_data['error']}")
+
+            body = intercepted_data["body"]
+            status = intercepted_data["status"]
+
+            if not body:
+                raise ValueError(f"Empty response from TikTok (status={status})")
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                body_str = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+                raise ValueError(f"Invalid JSON: {e} | body={body_str[:200]}")
+
+            return {"data": data, "session_id": session_id}
+
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
 
     def is_ready(self):
         return self._browser is not None and self._browser.is_connected()
@@ -409,7 +344,7 @@ def search():
     elapsed_ms = round((time.time() - start_time) * 1000, 1)
     next_cursor = result["next_cursor"]
     next_page_url = (
-        f"/search?q={query}&cursor={next_cursor}&search_id={result['search_id']}"
+        "/search?q=" + query + "&cursor=" + str(next_cursor) + "&search_id=" + str(result["search_id"])
         if result["has_more"] and next_cursor else None
     )
 
@@ -448,7 +383,7 @@ def health():
 def docs():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "endpoints": {
             "GET /search": {
                 "parameters": {
@@ -469,7 +404,7 @@ def docs():
 def index():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "endpoints": {
             "search": "/search?q=<query>",
             "pagination": "/search?q=<query>&cursor=<int>&search_id=<str>",
@@ -479,19 +414,9 @@ def index():
     })
 
 
-
-@app.route("/debug")
-def debug():
-    """Debug endpoint to check Playwright state."""
-    try:
-        raw = pw_manager._run_coro(pw_manager._debug_info(), timeout=60)
-        return jsonify(raw)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("TikTok Search API v5.0.0 (Single-Process)")
+    logger.info("TikTok Search API v6.0.0 (Network Interception)")
     logger.info("=" * 60)
     pw_manager.start_background()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
