@@ -1,15 +1,19 @@
 """
-TikTok Search API v6.3
+TikTok Search API v6.4
 ======================
 Single-process architecture: Flask + Playwright asyncio in background thread.
-Uses page.route() for buffered response interception - works on cloud IPs (Render).
-Key fix: page.route() buffers the response body, unlike page.on('response') which
-fails with 'No data found for resource with given identifier' on cloud environments.
+Key fixes:
+1. page.route() buffers the response body (fixes 'No data found' on cloud IPs)
+2. Inject fake msToken cookie - TikTok only checks existence, not validity
+   On Render/cloud IPs, TikTok doesn't set msToken, causing empty API responses.
+   Injecting any random base64 value as msToken resolves this.
 """
 import asyncio
+import base64
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 import urllib.parse
@@ -122,6 +126,14 @@ class PlaywrightManager:
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
+
+        # Inject a fake msToken cookie before navigation.
+        # TikTok only checks that msToken EXISTS (not its validity).
+        # On cloud IPs (Render), TikTok doesn't set msToken, causing empty API responses.
+        fake_ms_token = base64.urlsafe_b64encode(secrets.token_bytes(128)).decode().rstrip("=")
+        await context.add_cookies([
+            {"name": "msToken", "value": fake_ms_token, "domain": ".tiktok.com", "path": "/"},
+        ])
 
         page = await context.new_page()
         session_id = str(uuid.uuid4())
@@ -389,7 +401,7 @@ def health():
 def docs():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.3.0",
+        "version": "6.4.0",
         "endpoints": {
             "GET /search": {
                 "parameters": {
@@ -410,7 +422,7 @@ def docs():
 def index():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.3.0",
+        "version": "6.4.0",
         "endpoints": {
             "search": "/search?q=<query>",
             "pagination": "/search?q=<query>&cursor=<int>&search_id=<str>",
@@ -422,7 +434,7 @@ def index():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("TikTok Search API v6.3.0 (page.route() buffered interception)")
+    logger.info("TikTok Search API v6.4.0 (fake msToken injection + page.route() interception)")
     logger.info("=" * 60)
     pw_manager.start_background()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
