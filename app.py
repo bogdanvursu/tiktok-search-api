@@ -26,10 +26,10 @@ logger = logging.getLogger(__name__)
 
 PORT = int(os.environ.get("PORT", 5001))
 
-ANDROID_UA = (
-    "Mozilla/5.0 (Linux; Android 9; Pixel 3 Build/PQ3A.190801.002) "
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/91.0.4472.120 Mobile Safari/537.36"
+    "Chrome/120.0.0.0 Safari/537.36"
 )
 
 
@@ -112,15 +112,11 @@ class PlaywrightManager:
         await self._ensure_browser()
 
         context = await self._browser.new_context(
-            user_agent=ANDROID_UA,
-            viewport={"width": 390, "height": 844},
-            device_scale_factor=2,
-            is_mobile=True,
-            has_touch=True,
+            user_agent=DESKTOP_UA,
+            viewport={"width": 1280, "height": 800},
             locale="en-US",
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
-                "sec-ch-ua-mobile": "?1",
             },
         )
 
@@ -383,7 +379,7 @@ def health():
 def docs():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.0.0",
+        "version": "6.1.0",
         "endpoints": {
             "GET /search": {
                 "parameters": {
@@ -404,7 +400,7 @@ def docs():
 def index():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.0.0",
+        "version": "6.1.0",
         "endpoints": {
             "search": "/search?q=<query>",
             "pagination": "/search?q=<query>&cursor=<int>&search_id=<str>",
@@ -416,7 +412,7 @@ def index():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("TikTok Search API v6.0.0 (Network Interception)")
+    logger.info("TikTok Search API v6.1.0 (Desktop UA + Network Interception)")
     logger.info("=" * 60)
     pw_manager.start_background()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
