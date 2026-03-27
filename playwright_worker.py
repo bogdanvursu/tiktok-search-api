@@ -50,6 +50,7 @@ async (args) => {
         })
     });
     if (searchId) params.set('search_id', searchId);
+    const pageUrl = window.location.href;
     const resp = await fetch(
         '/api/search/general/full/?' + params.toString(),
         {
@@ -188,7 +189,7 @@ class AsyncPlaywrightWorker:
             logger.warning(f"Navigare parțială (OK): {type(e).__name__}")
 
         # Așteptare pentru generarea token-urilor JS
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(6000)
 
         new_sid = str(uuid.uuid4())
         self.sessions[new_sid] = {
@@ -226,8 +227,11 @@ class AsyncPlaywrightWorker:
 
         status = result.get("status", 0)
         body = result.get("body", "")
+        url = result.get("url", "")
+        page_url = result.get("pageUrl", "")
+        logger.info(f"TikTok response: status={status}, body_len={len(body)}, pageUrl={page_url[:80]}")
         if not body:
-            raise ValueError(f"Răspuns gol de la TikTok (status={status})")
+            raise ValueError(f"Răspuns gol de la TikTok (status={status}, pageUrl={page_url[:80]})")
         try:
             data = json.loads(body)
         except json.JSONDecodeError as e:
