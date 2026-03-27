@@ -1,29 +1,20 @@
-FROM python:3.11-slim
-
-# Dependențe sistem pentru Playwright Chromium
-RUN apt-get update && apt-get install -y \
-    wget curl gnupg ca-certificates \
-    libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libx11-6 \
-    libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-    libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
-    fonts-liberation libappindicator3-1 xdg-utils \
-    iproute2 procps \
-    && rm -rf /var/lib/apt/lists/*
+# Use Microsoft's Playwright Docker image which has all dependencies pre-installed
+FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
 
-# Copiere și instalare dependențe Python
+# Copy and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalare Playwright Chromium
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
-# Copiere cod sursă
+# Copy source code
 COPY . .
 
-EXPOSE 5001
+# Dynamic PORT (Render.com sets $PORT automatically, default 10000)
+ENV PORT=10000
+ENV WORKER_PORT=8764
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE $PORT
 
 CMD ["python3", "app.py"]
