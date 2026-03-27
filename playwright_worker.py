@@ -1,12 +1,12 @@
 """
 Playwright Worker — Async API cu asyncio
 =========================================
-
 Folosește Playwright async API pentru a evita problemele cu greenlet/threading.
 Toate operațiile Playwright rulează în același event loop asyncio.
 Comunicare cu Flask prin socket TCP local (port 8764).
-"""
 
+Optimizat pentru medii cu memorie limitată (Render free tier: 512MB).
+"""
 import asyncio
 import json
 import logging
@@ -50,7 +50,6 @@ async (args) => {
         })
     });
     if (searchId) params.set('search_id', searchId);
-
     const resp = await fetch(
         '/api/search/general/full/?' + params.toString(),
         {
@@ -76,11 +75,25 @@ class AsyncPlaywrightWorker:
         self.playwright = None
         self.browser = None
         self.sessions: Dict[str, Any] = {}
+        self._browser_lock = asyncio.Lock()
 
-    async def start(self):
+    async def _launch_browser(self):
+        """Lansează sau relansează browserul."""
         from playwright.async_api import async_playwright
-        logger.info("Pornire Playwright async...")
-        self.playwright = await async_playwright().start()
+
+        # Închide browser-ul existent dacă există
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+
+        if self.playwright is None:
+            logger.info("Pornire Playwright async...")
+            self.playwright = await async_playwright().start()
+
+        logger.info("Lansare Chromium...")
         self.browser = await self.playwright.chromium.launch(
             headless=True,
             args=[
@@ -89,23 +102,65 @@ class AsyncPlaywrightWorker:
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-gpu",
-                "--single-process",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-translate",
+                "--disable-plugins",
+                "--disable-images",
+                "--blink-settings=imagesEnabled=false",
+                "--js-flags=--max-old-space-size=128",
             ],
         )
-        logger.info("Playwright browser async pornit cu succes")
+        logger.info("Chromium pornit cu succes")
+
+    async def start(self):
+        await self._launch_browser()
 
     async def _get_or_create_session(self, session_id: Optional[str], query: str):
         """Returnează sesiunea existentă sau creează una nouă."""
+        # Verifică dacă browser-ul este activ
+        if not self.browser or not self.browser.is_connected():
+            logger.warning("Browser-ul nu este conectat, relansare...")
+            async with self._browser_lock:
+                if not self.browser or not self.browser.is_connected():
+                    await self._launch_browser()
+                    self.sessions = {}
+
         if session_id and session_id in self.sessions:
             session = self.sessions[session_id]
-            logger.info(f"Refolosire sesiune {session_id[:8]} pentru '{query}'")
-            return session["page"], session_id
+            try:
+                if not session["page"].is_closed():
+                    logger.info(f"Refolosire sesiune {session_id[:8]} pentru '{query}'")
+                    return session["page"], session_id
+            except Exception:
+                pass
+            del self.sessions[session_id]
+
+        # Curățare sesiuni vechi (> 3 min)
+        now = time.time()
+        expired = [k for k, v in list(self.sessions.items()) if now - v["created_at"] > 180]
+        for k in expired:
+            try:
+                await self.sessions[k]["context"].close()
+            except Exception:
+                pass
+            del self.sessions[k]
+
+        # Maxim 2 sesiuni simultane
+        if len(self.sessions) >= 2:
+            oldest_key = min(self.sessions, key=lambda k: self.sessions[k]["created_at"])
+            try:
+                await self.sessions[oldest_key]["context"].close()
+            except Exception:
+                pass
+            del self.sessions[oldest_key]
 
         # Creare context nou cu profil Android
         context = await self.browser.new_context(
             user_agent=ANDROID_UA,
             viewport={"width": 390, "height": 844},
-            device_scale_factor=3,
+            device_scale_factor=2,
             is_mobile=True,
             has_touch=True,
             locale="en-US",
@@ -114,20 +169,26 @@ class AsyncPlaywrightWorker:
                 "sec-ch-ua-mobile": "?1",
             },
         )
-        page = await context.new_page()
 
+        # Blochează resursele inutile
+        await context.route(
+            "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,mp4,webm}",
+            lambda route: route.abort()
+        )
+
+        page = await context.new_page()
         logger.info(f"Navigare la TikTok search: '{query}'")
         try:
             await page.goto(
                 f"https://www.tiktok.com/search?q={query}",
-                timeout=25000,
+                timeout=30000,
                 wait_until="commit",
             )
         except Exception as e:
             logger.warning(f"Navigare parțială (OK): {type(e).__name__}")
 
         # Așteptare pentru generarea token-urilor JS
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(4000)
 
         new_sid = str(uuid.uuid4())
         self.sessions[new_sid] = {
@@ -136,17 +197,6 @@ class AsyncPlaywrightWorker:
             "query": query,
             "created_at": time.time(),
         }
-
-        # Curățare sesiuni vechi (> 5 min)
-        now = time.time()
-        expired = [k for k, v in list(self.sessions.items()) if now - v["created_at"] > 300]
-        for k in expired:
-            try:
-                await self.sessions[k]["context"].close()
-            except Exception:
-                pass
-            del self.sessions[k]
-
         logger.info(f"Sesiune nouă creată: {new_sid[:8]}")
         return page, new_sid
 
@@ -154,7 +204,6 @@ class AsyncPlaywrightWorker:
                      search_id: Optional[str]) -> Dict:
         """Face o căutare TikTok și returnează rezultatele brute."""
         page, session_id = await self._get_or_create_session(search_id, query)
-
         logger.info(f"Fetch API: query='{query}' cursor={cursor} count={count}")
         try:
             result = await page.evaluate(
@@ -162,43 +211,47 @@ class AsyncPlaywrightWorker:
                 {"keyword": query, "cursor": cursor, "count": count, "searchId": search_id or ""}
             )
         except Exception as e:
-            raise RuntimeError(f"Eroare fetch: {e}")
+            # Dacă pagina s-a închis, încearcă cu o sesiune nouă
+            if "closed" in str(e).lower() or "target" in str(e).lower():
+                logger.warning(f"Pagina s-a închis, creare sesiune nouă: {e}")
+                if search_id and search_id in self.sessions:
+                    del self.sessions[search_id]
+                page, session_id = await self._get_or_create_session(None, query)
+                result = await page.evaluate(
+                    FETCH_JS,
+                    {"keyword": query, "cursor": cursor, "count": count, "searchId": ""}
+                )
+            else:
+                raise RuntimeError(f"Eroare fetch: {e}")
 
         status = result.get("status", 0)
         body = result.get("body", "")
-
         if not body:
             raise ValueError(f"Răspuns gol de la TikTok (status={status})")
-
         try:
             data = json.loads(body)
         except json.JSONDecodeError as e:
-            raise ValueError(f"JSON invalid: {e} | body={body[:100]}")
-
+            raise ValueError(f"JSON invalid: {e} | body={body[:200]}")
         return {"data": data, "session_id": session_id}
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Procesează un request de la Flask."""
         try:
-            raw = await asyncio.wait_for(reader.readline(), timeout=40)
+            raw = await asyncio.wait_for(reader.readline(), timeout=60)
             if not raw:
                 return
-
             req = json.loads(raw.decode())
             query = req["query"]
             cursor = req.get("cursor", 0)
             count = req.get("count", 12)
             search_id = req.get("search_id")
-
             result = await self.search(query, cursor, count, search_id)
             response = {"ok": True, "result": result}
-
         except asyncio.TimeoutError:
             response = {"ok": False, "error": "Timeout căutare TikTok"}
         except Exception as e:
             logger.error(f"Eroare request: {e}")
             response = {"ok": False, "error": str(e)}
-
         try:
             writer.write(json.dumps(response).encode() + b"\n")
             await writer.drain()
