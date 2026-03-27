@@ -1,8 +1,10 @@
 """
-TikTok Search API v6.0
+TikTok Search API v6.3
 ======================
 Single-process architecture: Flask + Playwright asyncio in background thread.
-Uses network response interception instead of JS fetch - works on cloud IPs too.
+Uses page.route() for buffered response interception - works on cloud IPs (Render).
+Key fix: page.route() buffers the response body, unlike page.on('response') which
+fails with 'No data found for resource with given identifier' on cloud environments.
 """
 import asyncio
 import json
@@ -106,8 +108,9 @@ class PlaywrightManager:
 
     async def _async_search(self, query, cursor, count, search_id):
         """
-        Search using network response interception.
-        This works even when TikTok does not set cookies for cloud IPs.
+        Search using page.route() for buffered response interception.
+        This approach buffers the response body via route.fetch(), which works
+        on cloud IPs (Render) where response.body() via page.on('response') fails.
         """
         await self._ensure_browser()
 
@@ -118,11 +121,6 @@ class PlaywrightManager:
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
             },
-        )
-
-        await context.route(
-            "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,mp4,webm}",
-            lambda route: route.abort()
         )
 
         page = await context.new_page()
@@ -152,19 +150,32 @@ class PlaywrightManager:
 
         api_url_prefix = "/api/search/general/full/"
 
-        async def handle_response(response):
-            if api_url_prefix in response.url and not intercept_event.is_set():
+        async def handle_route(route):
+            """
+            Use route.fetch() to buffer the response body.
+            This is the key fix: route.fetch() reads the body into memory,
+            making it available via response.body() even on cloud IPs.
+            """
+            if api_url_prefix in route.request.url and not intercept_event.is_set():
                 try:
+                    response = await route.fetch()
                     body = await response.body()
                     intercepted_data["body"] = body
                     intercepted_data["status"] = response.status
-                    logger.info(f"[PW] Intercepted API: status={response.status}, len={len(body)}")
+                    logger.info(f"[PW] Route intercepted API: status={response.status}, len={len(body)}")
                     intercept_event.set()
+                    await route.fulfill(response=response)
                 except Exception as e:
+                    logger.error(f"[PW] Route error: {e}")
                     intercepted_data["error"] = str(e)
                     intercept_event.set()
+                    await route.continue_()
+            elif any(ext in route.request.url for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.mp4', '.webm']):
+                await route.abort()
+            else:
+                await route.continue_()
 
-        page.on("response", handle_response)
+        await context.route("**", handle_route)
 
         try:
             logger.info(f"[PW] Navigating to TikTok search: {query!r}")
@@ -300,7 +311,7 @@ def _parse_posts(raw_data, cursor, count):
             continue
 
     has_more = bool(raw_data.get("has_more", 0))
-    next_cursor = raw_data.get("cursor", cursor + len(posts)) if has_more else None
+    next_cursor = raw_data.get("cursor", cursor + len(posts))
     search_id = raw_data.get("search_id") or raw_data.get("extra", {}).get("search_id")
 
     return {
@@ -357,7 +368,6 @@ def search():
         "meta": {
             "total_found": len(result["posts"]),
             "took_ms": elapsed_ms,
-            "android_user_agent": True,
         },
     })
 
@@ -379,7 +389,7 @@ def health():
 def docs():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.1.0",
+        "version": "6.3.0",
         "endpoints": {
             "GET /search": {
                 "parameters": {
@@ -400,7 +410,7 @@ def docs():
 def index():
     return jsonify({
         "name": "TikTok Search API",
-        "version": "6.1.0",
+        "version": "6.3.0",
         "endpoints": {
             "search": "/search?q=<query>",
             "pagination": "/search?q=<query>&cursor=<int>&search_id=<str>",
@@ -412,7 +422,7 @@ def index():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("TikTok Search API v6.1.0 (Desktop UA + Network Interception)")
+    logger.info("TikTok Search API v6.3.0 (page.route() buffered interception)")
     logger.info("=" * 60)
     pw_manager.start_background()
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
