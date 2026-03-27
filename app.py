@@ -263,6 +263,40 @@ class PlaywrightManager:
 
         return {"data": data, "session_id": session_id}
 
+
+    async def _debug_info(self):
+        """Get debug info about browser state."""
+        if not self._browser or not self._browser.is_connected():
+            return {"browser": "not connected"}
+        
+        context = await self._browser.new_context(
+            user_agent=ANDROID_UA, is_mobile=True, has_touch=True
+        )
+        page = await context.new_page()
+        try:
+            await page.goto("https://www.tiktok.com/search?q=test", timeout=20000, wait_until="commit")
+            await page.wait_for_timeout(5000)
+            
+            result = await page.evaluate("""
+                async () => {
+                    const cookies = document.cookie;
+                    const params = new URLSearchParams({keyword: 'test', offset: '0', count: '5', from_page: 'search'});
+                    const resp = await fetch('/api/search/general/full/?' + params.toString(), {credentials: 'include'});
+                    const text = await resp.text();
+                    return {
+                        pageUrl: window.location.href,
+                        cookieCount: cookies.split(';').length,
+                        cookieNames: cookies.split(';').map(c => c.trim().split('=')[0]),
+                        apiStatus: resp.status,
+                        apiBodyLen: text.length,
+                        apiBodyStart: text.substring(0, 200)
+                    };
+                }
+            """)
+            return result
+        finally:
+            await context.close()
+
     def is_ready(self):
         return self._browser is not None and self._browser.is_connected()
 
@@ -444,6 +478,16 @@ def index():
         },
     })
 
+
+
+@app.route("/debug")
+def debug():
+    """Debug endpoint to check Playwright state."""
+    try:
+        raw = pw_manager._run_coro(pw_manager._debug_info(), timeout=60)
+        return jsonify(raw)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     logger.info("=" * 60)
