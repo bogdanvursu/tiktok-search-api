@@ -1,19 +1,18 @@
-# Use Microsoft's Playwright Docker image which has all dependencies pre-installed
+# Playwright + Python — all Chromium dependencies pre-installed
 FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
 
 WORKDIR /app
 
-# Copy and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
 COPY . .
 
-# Dynamic PORT (Render.com sets $PORT automatically, default 10000)
-ENV PORT=10000
-ENV WORKER_PORT=8764
+# Default port — override with -e PORT=xxxx or in .env
+ENV PORT=5001
 ENV PYTHONUNBUFFERED=1
+# Optional proxy — set to e.g. http://user:pass@host:port or socks5://host:port
+ENV PROXY_SERVER=""
 
 EXPOSE $PORT
 
